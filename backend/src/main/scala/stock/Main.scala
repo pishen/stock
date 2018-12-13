@@ -8,6 +8,10 @@ import org.jsoup._
 import scalaj.http._
 import scala.collection.JavaConverters._
 import scala.util.{Random,Try,Failure,Success}
+import io.circe._
+import io.circe.generic.auto._
+import io.circe.parser._
+import io.circe.syntax._
 
 object Main {
   val userAgents = Seq(
@@ -91,18 +95,84 @@ object Main {
     } else proxies
   }
 
+  case class Transaction(date: LocalDate, stockId: String, share: Int, deposit: Int)
+  def parseTransactions() = {
+    val formatter = DateTimeFormatter.ofPattern("M/d/yy")
+    File("data/transactions.tsv").lines.map { line =>
+      val arr = line.split("\t")
+      val shareAmount = arr(5).toInt
+      Transaction(
+        LocalDate.parse(arr(1), formatter),
+        arr(3),
+        if (arr(15).toInt > 0) -shareAmount else shareAmount,
+        arr(15).toInt
+      )
+    }
+  }
+
+  case class TwseRes(stat: String, data5: Option[Seq[Seq[String]]])
+  def bake(trans: Seq[Transaction]) = {
+    val inventories = trans.groupBy(_.date)
+      .toSeq
+      .sortBy(_._1)
+      .map(_._2)
+      .scanLeft(Map.empty[String, Int]) { (inventory, trans) =>
+        (inventory.toSeq ++ trans.map(t => t.stockId -> t.share))
+          .groupBy(_._1)
+          .mapValues(_.map(_._2).sum)
+          .filter(_._2 > 0)
+      }
+      .tail
+    val tranDates = trans.map(_.date).distinct.sorted
+    tranDates.sliding(2)
+      .toSeq
+      .zip(inventories)
+      .flatMap { case (seq, inventory) =>
+        val startDate = seq(0)
+        val endDate = seq(1)
+          (startDate till endDate).map(_ -> inventory)
+      }
+      .:+(tranDates.last -> inventories.last)
+      .flatMap { case (date, inventory) =>
+        Some(File(s"data/twse/$date.json"))
+          .filter(_.exists)
+          .map(f => decode[TwseRes](f.contentAsString).right.get)
+          .flatMap(_.data5)
+          .map { data5 =>
+            data5.filter(inventory contains _(0))
+              .map(arr => arr(0) -> arr(8).toDouble)
+              .toMap
+          }
+          .map { closingPrices =>
+            val totalOwn = inventory
+              .toSeq
+              .map { case (stockId, share) =>
+                //TODO use previous price if no price available
+                share * closingPrices.get(stockId).getOrElse(0.0)
+              }
+              .sum
+              .toInt
+            date -> totalOwn
+          }
+      }
+  }
+
   def main(args: Array[String]): Unit = {
     println("Prepare proxies...")
     System.setProperty("https.protocols", "TLSv1.1,TLSv1.2")
     val proxies = getProxies()
 
     println("Prepare TWSE data...")
-    val startDate = LocalDate.parse("2016-01-01")
-    val endDate = LocalDate.parse("2016-12-31")
+    val startDate = LocalDate.parse("2015-09-01")
+    val endDate = LocalDate.parse("2015-12-31")
     Dsl.mkdirs(File("data/twse"))
     val dates = (startDate to endDate).filterNot { d =>
       d.getDayOfWeek == DayOfWeek.SUNDAY || d.getDayOfWeek == DayOfWeek.SATURDAY
     }
     dates.foldLeft(proxies)((proxies, date) => prepareTwse(date, proxies))
+
+    println("Reading transactions...")
+    val trans = parseTransactions().toSeq
+    bake(trans).foreach { case (date, own) => println(s"$date,$own") }
   }
 }
